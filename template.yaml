@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  todo-list-serverless
+
+  SAM Template for todo-list-serverless
+
+Globals:
+  Function:
+    Timeout: 3
+    Handler: app.lambda_handler
+    Tracing: Active
+    Runtime: python3.8
+
+Resources:
+
+  AwsLambdaPowertoolsPythonLayer:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:eu-west-1:057560766410:applications/aws-lambda-powertools-python-layer
+        SemanticVersion: 1.3.1 # change to latest semantic version available in SAR
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: "todo-list-archive-bucket-cb"
+
+  DeleteQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "delete-todo-queue"
+
+  QueueParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: "/todolist/deletequeue/url"
+      Type: String
+      Value: !Ref DeleteQueue
+      Description: SSM Parameter for the url of the todo list delete queue
+      Tags:
+        Environment: Dev
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "delete-queue-alarm-notification"
+      TopicName: delete-queue-alarm-topic
+      Subscription:
+        - Protocol: "lambda"
+          Endpoint: !GetAtt DeleteTodoFunction.Arn
+
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm if queue depth increases to more than 10 messages"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - 
+          Name: "QueueName"
+          Value: 
+            !GetAtt
+              - "DeleteQueue"
+              - "QueueName"
+      Statistic: "Sum"
+      Period: "300" # 5 mins
+      EvaluationPeriods: "1"
+      Threshold: "10"
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - Ref: "AlarmTopic"
+      InsufficientDataActions:
+        - Ref: "AlarmTopic"
+
+
+  DynamoDBDatabase:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "item_id"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "item_id"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+      TableName: Todos
+  
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: TodoListApi
+      Description: The API Gateway for the Todo List Application
+      StageName: Prod
+      TracingEnabled: true
+      MethodSettings:
+        - DataTraceEnabled: true
+          MetricsEnabled: true
+          #LoggingLevel: "INFO"
+          HttpMethod: "*"
+          ResourcePath: "/*"
+
+  CreateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/create_todo/
+      Environment:
+        Variables:
+          POWERTOOLS_LOGGER_LOG_EVENT: true
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: CreatePolicy
+          Effect: Allow
+          Action:
+          - dynamodb:PutItem
+          Resource: '*'
+      Events:
+        CreateTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/create
+            Method: post
+            RestApiId: !Ref ApiGateway
+
+  ListTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/list_todos/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: ListPolicy
+          Effect: Allow
+          Action:
+          - dynamodb:Scan
+          Resource: '*'
+      Events:
+        ListTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/list
+            Method: get
+            RestApiId: !Ref ApiGateway
+  UpdateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/update_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: UpdatePolicy
+          Effect: Allow
+          Action:
+          - dynamodb:UpdateItem
+          Resource: '*'
+      Events:
+        UpdateTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/update
+            Method: put
+            RestApiId: !Ref ApiGateway
+  
+  CompleteTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/complete_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: CompletePolicy
+          Effect: Allow
+          Action:
+          - dynamodb:UpdateItem
+          Resource: '*'
+      Events:
+        CompleteTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/complete/{item_id}
+            Method: post
+            RestApiId: !Ref ApiGateway       
+  MarkDeleteTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/mark_delete_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: MarkDeletePolicy
+          Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - sqs:SendMessage
+          Resource: '*'
+      Events:
+        MarkTodoDelete:
+          Type: Api
+          Properties:
+            Path: /todo-list/markdelete/{item_id}
+            Method: delete
+            RestApiId: !Ref ApiGateway
+  
+  DeleteTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/delete_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: DeletePolicy
+          Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - sqs:ReceiveMessage
+          - dynamodb:UpdateItem
+          Resource: '*'
+  
+  ArchiveTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/archive_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: ArchivePolicy
+          Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+          - s3:PutObject
+          Resource: '*'
+      Events:
+        ListTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/archive/{item_id}
+            Method: post
+            RestApiId: !Ref ApiGateway
+  
+  ListArchiveTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/list_archives/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: ListArchivePolicy
+          Effect: Allow
+          Action:
+          - s3:ListBucket
+          Resource: '*'
+      Events:
+        ListTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/archive/
+            Method: get
+            RestApiId: !Ref ApiGateway
+
+  GetTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/get_todo/
+      Layers:
+        - !GetAtt AwsLambdaPowertoolsPythonLayer.Outputs.LayerVersionArn
+      Policies:
+      - Statement:
+        - Sid: GetTodoPolicy
+          Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          Resource: '*'
+      Events:
+        GetTodo:
+          Type: Api
+          Properties:
+            Path: /todo-list/{item_id}
+            Method: get
+            RestApiId: !Ref ApiGateway
+
+
+Outputs:
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  CreateTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for Create Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/create"
+  ListTodosApi:
+    Description: "API Gateway endpoint URL for Prod stage for List Todos function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/list"
+  UpdateTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for Update Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/update"
+  CompleteTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for Complete Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/complete/{item_id}"
+  MarkDeleteTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for Mark Delete Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/markdelete/{item_id}"
+  ArchiveTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for Archive Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/archive/{item_id}"
+  ListArchiveTodoApi:
+    Description: "API Gateway endpoint URL for Prod stage for List archives Todo function"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/todo-list/archive/"
+  DeleteQueueURL:
+    Description: "The queue url of the delete queue"
+    Value: !Ref DeleteQueue
